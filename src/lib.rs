@@ -6,13 +6,14 @@
 //!
 //! | | 源文件里的写法 | 数量 |
 //! |---|---|---|
-//! | 日文原文 | `<p style="opacity:0.4;">…</p>` | 3215 段，淡化显示（原文在下） |
-//! | 中文译文 | `<p>…</p>` | 3371 段，正常显示（译文在上） |
+//! | 日文原文 | `<p style="opacity:0.4;">…</p>` | 3215 段，淡化显示，文档顺序里先出现 |
+//! | 中文译文 | `<p>…</p>` | 3371 段，正常显示，紧随对应日文段之后 |
 //! | 语言无关 | `<p><br /></p>` / `<p><img …/></p>` | 156 段，两本书都要 |
 //!
 //! 判别式因此只有一条：开标签带不带 `opacity` 样式。之所以敢只靠它：
 //!
-//! * 38 个正文文件里只有这两种 `<p>`，没有第三种变体；
+//! * 39 个 XHTML（其中 37 个含段落）里只有这两种 `<p>`，没有第三种变体；
+//! * 3215 对日/中段落严格交替，没有连续两段同语言（0 例外）；
 //! * 中文段落里假名出现 **0** 次；
 //! * 414 个 `<ruby>` 注音 **100%** 落在日文段落内。
 //!
@@ -41,6 +42,40 @@
 //!
 //! 依赖方向是单向的：`markup` 不认识语言，`split` / `metadata` 都只依赖
 //! `lang` + `markup`，`pipeline` 把它们串起来，`main` 只负责打印。
+//!
+//! # 作为库使用
+//!
+//! 各模块都是公开的，可以嵌进自己的流程。下面的例子（与 `README.md` 一致）
+//! 由 `cargo test` 编译校验，不会过时：
+//!
+//! ```no_run
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! use novelia_epub_bilingual_splitter::{audit, epub, lang::Lang, pipeline};
+//!
+//! let entries = epub::read_path("book.epub".as_ref())?;
+//!
+//! for lang in Lang::ALL {
+//!     let (archive, stats) = pipeline::build(&entries, lang);
+//!     println!(
+//!         "[{}] 留下 {} 段，丢弃 {} 段",
+//!         lang.tag(),
+//!         stats.paragraphs.paragraphs(),
+//!         stats.paragraphs.dropped
+//!     );
+//!
+//!     let mut buf = std::io::Cursor::new(Vec::new());
+//!     epub::write(&mut buf, &archive)?;
+//!     buf.set_position(0);
+//!
+//!     let report = audit::inspect(buf, lang)?;
+//!     assert!(report.is_clean());
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! `epub` 的读写都是泛型的，所以整条链路可以在内存里跑完（如上），
+//! 不必落任何临时文件。
 
 pub mod audit;
 pub mod epub;
