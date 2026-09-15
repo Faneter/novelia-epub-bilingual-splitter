@@ -4,12 +4,102 @@
 //! 哪一段是中文译文是 [`crate::split`] 的职责；这里只回答「这个 `<p>` 带不带
 //! 淡化样式」「这段内容是不是只是一张图」。
 
-/// 源书用来标记「日文原文」的内联样式。
+/// 判断一个开标签是否带「淡化」样式。
 ///
-/// 对照排版里原文被淡化成灰，所以整套样式表其实是空的（5 个 CSS 文件全是
-/// 0 字节），全部信息都压在这一个内联属性上——这也正是本工具能靠它做切分的
-/// 原因：判别式稳定、且不依赖字符集猜测。
-pub const FADING_STYLE: &str = "opacity:0.4;";
+/// 对照排版里原文被淡化成灰，而两本源书的 CSS 文件都是 0 字节（没有任何 class
+/// 可供识别），全部信息就压在这一个内联属性上。
+///
+/// 判定标准是 **`opacity` 的值小于 1**，而不是某个固定字面量——淡化多少因书而异，
+/// 写死 `opacity:0.4` 会在换一本书时失效。
+pub fn has_fading_style(open_tag: &str) -> bool {
+    find_style_attr(open_tag).is_some_and(|style| style.value.split(';').any(is_fading_declaration))
+}
+
+/// 去掉开标签里的淡化声明，**保留其它一切属性和声明**。
+///
+/// 不能简单地把整个开标签换成 `<p>`：实测另一本源书里有
+/// `<p id="page_171" class="class_s2t" style="opacity:0.4;">` 这种写法，
+/// 整段替换会把这些 `id` / `class` 一起抹掉。
+///
+/// 没有可删的声明时原样返回，不做无意义改写。
+pub fn strip_fading_style(open_tag: &str) -> String {
+    let Some(style) = find_style_attr(open_tag) else {
+        return open_tag.to_string();
+    };
+    if !style.value.split(';').any(is_fading_declaration) {
+        return open_tag.to_string();
+    }
+
+    let kept: Vec<&str> = style
+        .value
+        .split(';')
+        .map(str::trim)
+        .filter(|decl| !decl.is_empty() && !is_fading_declaration(decl))
+        .collect();
+
+    let mut out = String::with_capacity(open_tag.len());
+    if kept.is_empty() {
+        // style 属性整个都是用来淡化的 → 连属性一起删掉
+        out.push_str(open_tag[..style.attr_start].trim_end());
+        out.push_str(&open_tag[style.attr_end..]);
+    } else {
+        // 还留着别的声明 → 只换掉值
+        out.push_str(&open_tag[..style.value_start]);
+        out.push_str(&kept.join("; "));
+        out.push_str(&open_tag[style.value_end..]);
+    }
+    out
+}
+
+/// `style` 属性在开标签里的位置。
+struct StyleAttr<'a> {
+    /// `style=` 的起点。
+    attr_start: usize,
+    /// 闭合引号之后。
+    attr_end: usize,
+    /// 值本身的起止（不含引号）。
+    value_start: usize,
+    value_end: usize,
+    value: &'a str,
+}
+
+/// 找出 `style="…"`：单双引号都认，属性名大小写不敏感。
+fn find_style_attr(open_tag: &str) -> Option<StyleAttr<'_>> {
+    let bytes = open_tag.as_bytes();
+    let mut i = 0usize;
+    while i + 7 <= bytes.len() {
+        if bytes[i..i + 6].eq_ignore_ascii_case(b"style=") {
+            let quote = bytes[i + 6];
+            if quote == b'"' || quote == b'\'' {
+                let value_start = i + 7;
+                let end = open_tag[value_start..].find(quote as char)?;
+                let value_end = value_start + end;
+                return Some(StyleAttr {
+                    attr_start: i,
+                    attr_end: value_end + 1,
+                    value_start,
+                    value_end,
+                    value: &open_tag[value_start..value_end],
+                });
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// 一条 CSS 声明是不是「淡化」：属性是 `opacity` 且值小于 1。
+fn is_fading_declaration(declaration: &str) -> bool {
+    let Some((property, value)) = declaration.split_once(':') else {
+        return false;
+    };
+    if !property.trim().eq_ignore_ascii_case("opacity") {
+        return false;
+    }
+    // 容忍 `0.4 !important` 这类写法
+    let number = value.split('!').next().unwrap_or("").trim();
+    number.parse::<f32>().is_ok_and(|v| v < 1.0)
+}
 
 /// 一个 XHTML 文档被切成的片段。
 pub enum Segment {
@@ -74,24 +164,41 @@ pub fn is_neutral_para(inner: &str) -> bool {
 }
 
 /// 取元素内部的文本（只返回第一个匹配）。
-pub fn element_text(doc: &str, open: &str, close: &str) -> Option<String> {
-    let start = doc.find(open)? + open.len();
-    let end = start + doc[start..].find(close)?;
-    Some(doc[start..end].trim().to_string())
+///
+/// 开标签可以带任意属性，所以 `<dc:title>` 和 `<dc:title id="id">` 都能命中
+/// ——实测两本源书在这点上不一样，按死板的开标签匹配会漏。
+pub fn element_text(doc: &str, tag: &str) -> Option<String> {
+    let close = format!("</{tag}>");
+    let open_end = open_tag_end(doc, tag)?;
+    let end = open_end + doc[open_end..].find(&close)?;
+    Some(doc[open_end..end].trim().to_string())
 }
 
 /// 替换元素内部的文本。
 ///
-/// 找不到元素就原样返回——源文件缺某个标签时不应该让整个流程失败。
-pub fn replace_element_text(doc: &str, open: &str, close: &str, new_text: &str) -> String {
-    let Some(start) = doc.find(open).map(|i| i + open.len()) else {
-        return doc.to_string();
-    };
-    let Some(rel) = doc[start..].find(close) else {
-        return doc.to_string();
-    };
-    let end = start + rel;
-    format!("{}{}{}", &doc[..start], new_text, &doc[end..])
+/// 元素不存在时返回 `None`，让调用方自己决定是「放弃」还是「补一个」——
+/// 实测有一本源书压根没有 `<dc:identifier>` 元素。
+pub fn replace_element_text(doc: &str, tag: &str, new_text: &str) -> Option<String> {
+    let close = format!("</{tag}>");
+    let open_end = open_tag_end(doc, tag)?;
+    let end = open_end + doc[open_end..].find(&close)?;
+    let mut out = String::with_capacity(doc.len());
+    out.push_str(&doc[..open_end]);
+    out.push_str(new_text);
+    out.push_str(&doc[end..]);
+    Some(out)
+}
+
+/// 找到 `<tag …>` 里 `>` 之后的位置。
+fn open_tag_end(doc: &str, tag: &str) -> Option<usize> {
+    let needle = format!("<{tag}");
+    let after_name = doc.find(&needle)? + needle.len();
+    // 后面必须紧跟 `>` 或空白，否则 `<dc:titleX>` 之类会被误命中。
+    let next = doc[after_name..].chars().next()?;
+    if next != '>' && !next.is_whitespace() {
+        return None;
+    }
+    Some(after_name + doc[after_name..].find('>')? + 1)
 }
 
 #[cfg(test)]
@@ -124,7 +231,7 @@ mod tests {
         let doc = "<p style=\"opacity:0.4;\">原文</p>";
         let (open, inner) = paras(doc).remove(0);
         assert_eq!(open, "<p style=\"opacity:0.4;\">");
-        assert!(open.contains(FADING_STYLE));
+        assert!(has_fading_style(&open));
         assert_eq!(inner, "原文");
     }
 
@@ -170,21 +277,107 @@ mod tests {
     #[test]
     fn element_text_reads_and_trims() {
         let doc = "<dc:language>\n   zh-CN\n  </dc:language>";
-        assert_eq!(
-            element_text(doc, "<dc:language>", "</dc:language>").unwrap(),
-            "zh-CN"
-        );
-        assert_eq!(element_text(doc, "<dc:title>", "</dc:title>"), None);
+        assert_eq!(element_text(doc, "dc:language").unwrap(), "zh-CN");
+        assert_eq!(element_text(doc, "dc:title"), None);
     }
 
     #[test]
-    fn replace_element_text_is_lenient_about_missing_elements() {
+    fn element_text_accepts_attributes_on_the_open_tag() {
+        // 两本源书在这点上不同：一本写 <dc:title>，另一本写 <dc:title id="id">。
+        assert_eq!(
+            element_text("<dc:title id=\"id\">书名</dc:title>", "dc:title").unwrap(),
+            "书名"
+        );
+        assert_eq!(
+            element_text("<dc:identifier id=\"BookId\">42</dc:identifier>", "dc:identifier")
+                .unwrap(),
+            "42"
+        );
+    }
+
+    #[test]
+    fn element_text_does_not_match_a_longer_tag_name() {
+        // `<dc:titleX>` 不该被当成 `<dc:title>`。
+        assert_eq!(element_text("<dc:titleX>甲</dc:titleX>", "dc:title"), None);
+    }
+
+    #[test]
+    fn replace_element_text_reports_a_missing_element() {
         let doc = "<dc:language>zh-CN</dc:language>";
         assert_eq!(
-            replace_element_text(doc, "<dc:language>", "</dc:language>", "ja"),
+            replace_element_text(doc, "dc:language", "ja").unwrap(),
             "<dc:language>ja</dc:language>"
         );
-        // 元素不存在时原样返回，而不是留下半截内容。
-        assert_eq!(replace_element_text(doc, "<dc:bogus>", "</dc:bogus>", "x"), doc);
+        // 元素不存在时返回 None，交给调用方决定怎么办。
+        assert_eq!(replace_element_text(doc, "dc:bogus", "x"), None);
+    }
+
+    #[test]
+    fn replace_element_text_keeps_the_open_tag_attributes() {
+        assert_eq!(
+            replace_element_text("<dc:title id=\"id\">旧</dc:title>", "dc:title", "新").unwrap(),
+            "<dc:title id=\"id\">新</dc:title>"
+        );
+    }
+
+    #[test]
+    fn fading_style_is_detected_by_the_opacity_value() {
+        assert!(has_fading_style("<p style=\"opacity:0.4;\">"));
+        assert!(has_fading_style("<p style=\"opacity: 0.5\">"), "淡化多少因书而异");
+        assert!(has_fading_style("<p style=\"OPACITY:0.4\">"), "属性名大小写不敏感");
+        assert!(has_fading_style("<p style=\"opacity:0.4 !important\">"));
+        assert!(
+            has_fading_style("<p id=\"page_171\" class=\"class_s2t\" style=\"opacity:0.4;\">"),
+            "淡化声明可以和别的属性共存"
+        );
+    }
+
+    #[test]
+    fn non_fading_paragraphs_are_not_flagged() {
+        assert!(!has_fading_style("<p>"));
+        assert!(!has_fading_style("<p class=\"class_s2t\">"));
+        assert!(!has_fading_style("<p style=\"opacity:1;\">"), "不透明不算淡化");
+        assert!(!has_fading_style("<p style=\"opacity:1.0\">"));
+        assert!(!has_fading_style("<p style=\"color:red;\">"), "别的属性不能被误判");
+    }
+
+    #[test]
+    fn stripping_fading_style_keeps_every_other_attribute() {
+        // 实测另一本源书的写法：整段替换会连 id / class 一起丢掉。
+        assert_eq!(
+            strip_fading_style("<p id=\"page_171\" class=\"class_s2t\" style=\"opacity:0.4;\">"),
+            "<p id=\"page_171\" class=\"class_s2t\">"
+        );
+        assert_eq!(
+            strip_fading_style("<p class=\"pius2\" style=\"opacity:0.4;\">"),
+            "<p class=\"pius2\">"
+        );
+        assert_eq!(strip_fading_style("<p style=\"opacity:0.4;\">"), "<p>");
+    }
+
+    #[test]
+    fn stripping_keeps_other_style_declarations() {
+        assert_eq!(
+            strip_fading_style("<p style=\"color:red; opacity:0.4;\">"),
+            "<p style=\"color:red\">"
+        );
+        assert_eq!(
+            strip_fading_style("<p style='opacity:0.4;text-align:center'>"),
+            "<p style='text-align:center'>"
+        );
+    }
+
+    #[test]
+    fn stripping_a_paragraph_without_fading_changes_nothing() {
+        // 没有可删的声明就必须字节不变，否则会给所有中文段做无意义改写。
+        for open in ["<p>", "<p class=\"x\">", "<p style=\"opacity:1;\">", "<p>"] {
+            assert_eq!(strip_fading_style(open), open);
+        }
+    }
+
+    #[test]
+    fn stripping_is_idempotent() {
+        let once = strip_fading_style("<p id=\"a\" style=\"opacity:0.4;\">");
+        assert_eq!(strip_fading_style(&once), once, "去一次和去两次结果必须相同");
     }
 }

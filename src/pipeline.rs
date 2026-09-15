@@ -5,8 +5,7 @@
 
 use crate::epub::Entry;
 use crate::lang::Lang;
-use crate::markup;
-use crate::metadata;
+use crate::metadata::{self, Plan};
 use crate::split::{self, Stats};
 
 /// 整本书的拆分结果。
@@ -52,8 +51,10 @@ fn classify(name: &str) -> Kind {
 }
 
 /// 生成某一语言的整套条目，顺序与源归档保持一致。
-pub fn build(source: &[Entry], lang: Lang) -> (Vec<Entry>, BookStats) {
-    let base_id = original_identifier(source);
+///
+/// 书名、书籍 ID 等每本书各不相同的信息由 `plan` 提供（见
+/// [`crate::metadata::SourceMeta`] 与 [`crate::metadata::Plan`]）。
+pub fn build(source: &[Entry], lang: Lang, plan: &Plan) -> (Vec<Entry>, BookStats) {
     let mut out = Vec::with_capacity(source.len());
     let mut stats = BookStats::default();
 
@@ -66,8 +67,8 @@ pub fn build(source: &[Entry], lang: Lang) -> (Vec<Entry>, BookStats) {
                 stats.absorb(name, &page_stats);
                 doc.into_bytes()
             }
-            (Ok(text), Kind::Opf) => metadata::rewrite_opf(text, lang, &base_id).into_bytes(),
-            (Ok(text), Kind::Ncx) => metadata::rewrite_ncx(text, lang).into_bytes(),
+            (Ok(text), Kind::Opf) => metadata::rewrite_opf(text, lang, plan).into_bytes(),
+            (Ok(text), Kind::Ncx) => metadata::rewrite_ncx(text, lang, plan).into_bytes(),
             // 插图是两本书共享的资源，都要带上一份。
             _ => data.clone(),
         };
@@ -75,16 +76,6 @@ pub fn build(source: &[Entry], lang: Lang) -> (Vec<Entry>, BookStats) {
     }
 
     (out, stats)
-}
-
-/// 从源 OPF 里取出原始 identifier，用来派生两个互不相同的书籍 ID。
-fn original_identifier(source: &[Entry]) -> String {
-    source
-        .iter()
-        .find(|(name, _)| name.ends_with(".opf"))
-        .and_then(|(_, data)| std::str::from_utf8(data).ok())
-        .and_then(|opf| markup::element_text(opf, "<dc:identifier id=\"uid\">", "</dc:identifier>"))
-        .unwrap_or_else(|| "novelia-epub-splitter".to_string())
 }
 
 #[cfg(test)]
@@ -128,11 +119,15 @@ mod tests {
             .1
     }
 
+    fn plan() -> Plan {
+        Plan::new("试验书", "999")
+    }
+
     #[test]
     fn keeps_every_entry_in_order() {
         let src = source();
         for lang in Lang::ALL {
-            let (out, _) = build(&src, lang);
+            let (out, _) = build(&src, lang, &plan());
             assert_eq!(out.len(), src.len(), "条目数不能变");
             let names: Vec<_> = out.iter().map(|(n, _)| n.as_str()).collect();
             let expected: Vec<_> = src.iter().map(|(n, _)| n.as_str()).collect();
@@ -143,7 +138,7 @@ mod tests {
     #[test]
     fn passes_binary_entries_through_untouched() {
         let src = source();
-        let (out, _) = build(&src, Lang::Ja);
+        let (out, _) = build(&src, Lang::Ja, &plan());
         assert_eq!(find(&out, "OEBPS/Images/a.jpeg"), &[0xFF, 0xD8, 0xFF, 0xE0, 0x00]);
         assert_eq!(find(&out, "mimetype"), b"application/epub+zip");
     }
@@ -152,20 +147,34 @@ mod tests {
     fn splits_text_and_rewrites_metadata() {
         let src = source();
 
-        let (ja, stats) = build(&src, Lang::Ja);
+        let (ja, stats) = build(&src, Lang::Ja, &plan());
         let text = String::from_utf8_lossy(find(&ja, "OEBPS/Text/a.xhtml")).into_owned();
         assert!(text.contains("日本語"));
         assert!(!text.contains("中文"));
         let opf = String::from_utf8_lossy(find(&ja, "OEBPS/content.opf")).into_owned();
         assert!(opf.contains("<dc:language>ja</dc:language>"));
+        assert!(opf.contains("999-ja"));
         assert_eq!(stats.paragraphs.jp_kept, 1);
         assert_eq!(stats.paragraphs.dropped, 1);
 
-        let (zh, stats) = build(&src, Lang::Zh);
+        let (zh, stats) = build(&src, Lang::Zh, &plan());
         let text = String::from_utf8_lossy(find(&zh, "OEBPS/Text/a.xhtml")).into_owned();
         assert!(text.contains("中文"));
         assert!(!text.contains("日本語"));
         assert_eq!(stats.paragraphs.zh_kept, 1);
+    }
+
+    #[test]
+    fn xml_lang_follows_the_target_language() {
+        // 源书声明 zh-CN 时，日文版也必须声明 ja（早期版本只做中文方向）。
+        let src = vec![(
+            "OEBPS/Text/a.xhtml".into(),
+            "<html xml:lang=\"zh-CN\"><body><p>中文</p></body></html>".as_bytes().to_vec(),
+        )];
+        let (ja, _) = build(&src, Lang::Ja, &plan());
+        assert!(
+            String::from_utf8_lossy(find(&ja, "OEBPS/Text/a.xhtml")).contains("xml:lang=\"ja\"")
+        );
     }
 
     #[test]
@@ -174,19 +183,18 @@ mod tests {
             "OEBPS/Text/jp_only.xhtml".into(),
             "<p style=\"opacity:0.4;\">日本語だけ</p>".as_bytes().to_vec(),
         )];
-        let (_, stats) = build(&src, Lang::Zh);
+        let (_, stats) = build(&src, Lang::Zh, &plan());
         assert_eq!(stats.empty_pages, vec!["OEBPS/Text/jp_only.xhtml"]);
 
-        let (_, stats) = build(&src, Lang::Ja);
+        let (_, stats) = build(&src, Lang::Ja, &plan());
         assert!(stats.empty_pages.is_empty());
     }
 
     #[test]
     fn works_without_an_opf() {
-        // 源文件缺 OPF 时不该失败，只是退化成默认 identifier。
+        // 源文件缺 OPF 时不该失败：没有元数据可改，条目原样透传即可。
         let src = vec![("OEBPS/Text/a.xhtml".into(), b"<p>hi</p>".to_vec())];
-        let (out, _) = build(&src, Lang::Ja);
+        let (out, _) = build(&src, Lang::Ja, &plan());
         assert_eq!(out.len(), 1);
-        assert_eq!(original_identifier(&src), "novelia-epub-splitter");
     }
 }

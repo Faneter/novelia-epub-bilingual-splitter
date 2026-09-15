@@ -1,14 +1,21 @@
 //! 核心：按内联样式把双语 XHTML 过滤成单语言。
 //!
-//! 判别式只有一条——`<p>` 的开标签带不带 [`markup::FADING_STYLE`]。
-//! 带的是日文原文（在对照排版里被淡化），不带的是中文译文。
+//! 判别式只有一条——`<p>` 是否带「淡化」样式（[`markup::has_fading_style`]）：
+//! 带的是日文原文（在对照排版里被淡化成灰），不带的是中文译文。
 //!
-//! 之所以敢只靠这一条属性：源书 39 个 XHTML（37 个含段落）里只有这两种 `<p>`，
-//! 没有第三种变体；而且中文段落里假名出现 0 次、414 个 `<ruby>` 注音 100% 落在日文段落内。
+//! 之所以敢只靠这一条，是因为实测两本对照源书都满足：
+//!
+//! * 段落只有「淡化」和「不淡化」两类，没有第三种变体；
+//! * 中文段落里假名几乎不出现（零星出现的是合法保留的日文专有名词）；
+//! * 注音 `<ruby>` 只出现在日文段落里。
+//!
 //! 所以切分零歧义，不需要任何语言识别。
+//!
+//! 注意**两本源书的段落顺序恰好相反**（一本日文在前、一本中文在前），
+//! 这里完全按样式判断，不依赖顺序。
 
 use crate::lang::Lang;
-use crate::markup::{self, FADING_STYLE, Segment};
+use crate::markup::{self, Segment};
 use crate::metadata;
 
 /// 一份文档（或整本书累加后）的段落去向统计。
@@ -73,7 +80,7 @@ pub fn split_document(doc: &str, lang: Lang) -> (String, Stats) {
         match segment {
             Segment::Raw(text) => out.push_str(&metadata::rewrite_raw(&text, lang)),
             Segment::Para { open, inner } => {
-                let is_japanese = open.contains(FADING_STYLE);
+                let is_japanese = markup::has_fading_style(&open);
 
                 if markup::is_neutral_para(&inner) {
                     // 图片页与空行：两种语言都要，砍掉会破坏段落节奏。
@@ -81,8 +88,9 @@ pub fn split_document(doc: &str, lang: Lang) -> (String, Stats) {
                     stats.neutral_kept += 1;
                 } else if is_japanese == (lang == Lang::Ja) {
                     if is_japanese {
-                        // 关键：淡化样式必须去掉。留着的话日文版整本都是灰的。
-                        write_para(&mut out, "<p>", &inner);
+                        // 关键：淡化样式必须去掉，否则日文版整本都是灰的。
+                        // 只剥掉这一个声明，`id` / `class` 等属性都要留住。
+                        write_para(&mut out, &markup::strip_fading_style(&open), &inner);
                         stats.jp_kept += 1;
                     } else {
                         write_para(&mut out, &open, &inner);
@@ -126,7 +134,7 @@ mod tests {
         assert!(ja.contains("<ruby>"), "日文版必须保留注音");
         assert!(!ja.contains("你好"), "日文版不该有中文译文");
         assert!(
-            !ja.contains(FADING_STYLE),
+            !ja.contains("opacity"),
             "日文版必须去掉淡化样式，否则整本是灰的"
         );
         assert_eq!(stats.jp_kept, 1);
@@ -148,7 +156,7 @@ mod tests {
         assert!(!zh.contains("<ruby>"), "中文版不该有日文注音");
         assert!(zh.contains("xml:lang=\"zh-CN\""), "lang 属性要改写");
         assert!(zh.contains(">第一章</h2>"), "中文版章标题要汉化");
-        assert!(!zh.contains(FADING_STYLE));
+        assert!(!zh.contains("opacity"));
         assert_eq!(stats.zh_kept, 1);
         assert_eq!(stats.jp_kept, 0);
         assert_eq!(stats.dropped, 1);

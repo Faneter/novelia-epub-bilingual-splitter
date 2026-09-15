@@ -1,7 +1,11 @@
 //! 语言领域模型。
 //!
-//! 本工具只处理两种语言。凡是会出现在元数据里的写法（`ja`、`zh-CN`、书名）
-//! 都集中在这里，避免这些字面量散落到各个模块里去。
+//! 本工具只处理两种语言，凡是与语言绑定、且**与具体哪本书无关**的写法
+//! （文件名后缀、`dc:language`、`xml:lang`）都集中在这里。
+//!
+//! 书名**不在这里**：它是每本书各不相同的，必须从源文件读出来
+//! （见 [`crate::metadata::SourceMeta`]）。曾经把它写死在这张表里，
+//! 结果换一本书就会把上一本书的书名盖到新书上。
 
 /// 拆分目标语言。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -24,29 +28,25 @@ impl Lang {
         }
     }
 
-    /// OPF 里的 `dc:language`。
+    /// 该语言的标准标签：OPF 里的 `dc:language`，同时也是 XHTML 上的
+    /// `xml:lang` 取值。
     ///
-    /// 注意源书写死成 `zh-CN`，对日文版是错的，所以必须按目标语言改写。
+    /// 源书的 `dc:language` 未必对（实测两本源书都写死成 `zh-CN`），
+    /// 所以两个方向都必须按目标语言改写，而不是只改一边。
     pub fn dc_language(self) -> &'static str {
         match self {
             Lang::Ja => "ja",
             Lang::Zh => "zh-CN",
         }
     }
-
-    /// 书名。中文名取自源书奥付里的「凯物×女友」。
-    pub fn book_title(self) -> &'static str {
-        match self {
-            Lang::Ja => "カイブツ×カノジョ (講談社ラノベ文庫)",
-            Lang::Zh => "凯物×女友",
-        }
-    }
 }
 
 /// 是否含日文假名。
 ///
-/// 源书的中文段落里假名出现 0 次，所以拿它当「混进了未翻译原文」的探针，
-/// 供 [`crate::audit`] 做产物自检。注意汉字不算假名——中文里也有汉字。
+/// 用来判断「中文段落里是不是混进了未翻译的日文」。注意这只是**启发式**：
+/// 中文译本里会合法地保留一些日文专有名词（实测有 `ダンTV`、`とくまろ` 这类
+/// 服务名和人名），所以 [`crate::audit`] 只在「整页大面积命中」时才当作故障，
+/// 零星命中只提示。
 pub fn contains_kana(text: &str) -> bool {
     text.chars()
         .any(|c| matches!(c, '\u{3041}'..='\u{3096}' | '\u{30A1}'..='\u{30FA}' | '\u{30FC}'))
@@ -73,13 +73,18 @@ mod tests {
     }
 
     #[test]
-    fn every_language_has_distinct_metadata() {
+    fn chinese_translations_may_legitimately_keep_japanese_names() {
+        // 这三句都是实测的中文正文，假名部分是保留的专有名词。
+        // 它们会命中 contains_kana，所以调用方不能把「有假名」直接当成故障。
+        assert!(contains_kana("你竟然在ダンTV的在线人数排行榜上排名第一了！"));
+        assert!(contains_kana("负责插画的とくまろ老师。"));
+    }
+
+    #[test]
+    fn every_language_has_a_distinct_tag() {
         let tags: Vec<_> = Lang::ALL.iter().map(|l| l.tag()).collect();
         let langs: Vec<_> = Lang::ALL.iter().map(|l| l.dc_language()).collect();
-        let titles: Vec<_> = Lang::ALL.iter().map(|l| l.book_title()).collect();
-        // 两本书的这三项都必须不同，否则阅读器会当成同一本书。
-        assert_ne!(tags[0], tags[1]);
+        assert_ne!(tags[0], tags[1], "两个产物文件名必须不同，否则会互相覆盖");
         assert_ne!(langs[0], langs[1]);
-        assert_ne!(titles[0], titles[1]);
     }
 }

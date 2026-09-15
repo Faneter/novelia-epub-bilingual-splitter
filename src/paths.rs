@@ -52,6 +52,41 @@ pub fn output_path(source: &Path, lang: Lang) -> PathBuf {
     source.with_file_name(format!("{stem}.{}.epub", lang.tag()))
 }
 
+/// 从文件名粗略推导书名，作为源 OPF 里没有书名时的兜底。
+///
+/// 实测源文件名形如 `jp-zh.Ys.カイブツ×カノジョ (講談社ラノベ文庫).epub`：
+/// 开头的 `jp-zh.Ys.` 是语言对与压制者标记，不属于书名。规则是从头开始逐段
+/// 剥掉「只由 ASCII 字母数字和连字符组成」的点分段，遇到第一段含非 ASCII 字符
+/// 就停下。
+///
+/// 只在**剩下部分含非 ASCII 字符**时才剥，这样纯英文书名里的点（`My.Book`）
+/// 不会被误当成标记分隔符。
+pub fn title_from_filename(path: &Path) -> String {
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    let mut rest = stem.as_str();
+    while let Some((head, tail)) = rest.split_once('.') {
+        let looks_like_tag = !head.is_empty()
+            && head
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+        if !looks_like_tag || tail.is_ascii() {
+            break;
+        }
+        rest = tail;
+    }
+
+    let title = rest.trim();
+    if title.is_empty() {
+        stem
+    } else {
+        title.to_string()
+    }
+}
+
 fn is_epub(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
@@ -98,5 +133,27 @@ mod tests {
         let source = resolve_source(Some(PathBuf::from("whatever.epub"))).unwrap();
         assert_eq!(source.path, PathBuf::from("whatever.epub"));
         assert!(source.alternatives.is_empty());
+    }
+
+    #[test]
+    fn title_is_derived_from_the_filename() {
+        // 实测的两本源书文件名：前导的 `xx-yy.` 与压制者标记 `Ys.` 都要剥掉。
+        assert_eq!(
+            title_from_filename(Path::new("jp-zh.Ys.カイブツ×カノジョ (講談社ラノベ文庫).epub")),
+            "カイブツ×カノジョ (講談社ラノベ文庫)"
+        );
+        assert_eq!(
+            title_from_filename(Path::new(
+                "zh-jp.Ys.幼女系底辺ダンジョン配信者、配信切り忘れてS級モンスターを愛でてたら魔王と勘違いされてバズってしまう_1.epub"
+            )),
+            "幼女系底辺ダンジョン配信者、配信切り忘れてS級モンスターを愛でてたら魔王と勘違いされてバズってしまう_1"
+        );
+    }
+
+    #[test]
+    fn title_derivation_does_not_eat_dots_in_ascii_titles() {
+        // 纯 ASCII 书名里的点不能被当成标记分隔符。
+        assert_eq!(title_from_filename(Path::new("My.Book.epub")), "My.Book");
+        assert_eq!(title_from_filename(Path::new("book.epub")), "book");
     }
 }
